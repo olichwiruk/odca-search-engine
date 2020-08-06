@@ -17,11 +17,21 @@ module Schemas
           raise "Namespace '_any' is forbidden" if namespace == '_any'
 
           params = validate(raw_params)
+          file = params[:file][:tempfile]
           type = params[:file][:filename].split('.').last
+          schema_base_validator = SchemaBaseValidator.new(
+            schema_name_validator: SchemaNameValidator.new(es, namespace)
+          )
           if type == 'json'
-            store_json(namespace, params[:file][:tempfile])
+            schema_base = JSON.parse(file.read)
+            result = schema_base_validator.call(schema_base)
+            raise result.errors.to_h if result.failure?
+            dri = store_schema_base(namespace, schema_base)
           elsif type == 'zip'
-            store_zip(namespace, params[:file][:tempfile])
+            schema = extract_zip(file)
+            result = schema_base_validator.call(schema[:schema_base].values[0])
+            raise result.errors.to_h if result.failure?
+            dri = store_branch(namespace, schema)
           else
             raise 'File type must be json or zip'
           end
@@ -34,8 +44,7 @@ module Schemas
           }
         end
 
-        private def store_json(namespace, file)
-          schema_base = JSON.parse(file.read)
+        private def store_schema_base(namespace, schema_base)
           hashlink = hashlink_generator.call(schema_base)
           record = {
             _id: namespace + '/' + hashlink,
@@ -47,9 +56,7 @@ module Schemas
           hashlink
         end
 
-        private def store_zip(namespace, file)
-          schema = extract_zip(file)
-
+        private def store_branch(namespace, schema)
           es.index(:schema_base).bulk_index(
             schema[:schema_base].map do |hashlink, content|
               {
@@ -103,6 +110,51 @@ module Schemas
             end
           end
           schema
+        end
+
+        class SchemaBaseValidator < Dry::Validation::Contract
+          option :schema_name_validator
+
+          params do
+            required(:@context).filled(:string)
+            required(:name).filled(:string)
+            required(:type).filled(:string)
+            required(:description).value(:str?)
+            required(:classification).value(:str?)
+            required(:issued_by).value(:str?)
+            required(:attributes).filled(:hash)
+            required(:pii_attributes).value(:array?)
+          end
+
+          rule(:name) do
+            unless schema_name_validator.available?(values[:name])
+              key.failure('Schema Base name is taken in that namespace')
+            end
+          end
+        end
+
+        class SchemaNameValidator
+          attr_reader :es, :namespace
+
+          def initialize(es, namespace)
+            @es = es
+            @namespace = namespace
+          end
+
+          def available?(name)
+            query = {
+              bool: {
+                must:  [
+                  { match: { namespace: namespace } },
+                  { match: { 'data.name' => name } }
+                ]
+              }
+            }
+            total = es.index(:schema_base)
+              .search(size: 1, query: query)
+              .total['value']
+            total.zero?
+          end
         end
       end
     end
